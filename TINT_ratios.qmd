@@ -1,0 +1,197 @@
+---
+title: "TINT - gene ratios"
+author: "Eva Freyhult"
+date:  "today"
+date-format: long
+embed-resources: true
+format: 
+  html:
+    page-layout: full
+    number-sections: true
+    toc: true
+  docx:
+    number-sections: true
+    toc: true
+execute: 
+  echo: false
+  message: false
+  warning: false
+  cache: true
+knitr:
+  opts_chunk:
+    fig.path: "figure/" 
+    dev:
+     - png
+     - pdf
+params:
+  esetdir: '~/Support/4709/TINT/data/esets'
+---
+
+```{r setupratios}
+library(tidyverse)
+library(gt)
+library(ggplot2)
+
+library(oligo)
+
+library(limma)
+library(lmerTest)
+library(multcomp)
+library(broom)
+```
+
+
+```{r loaddata}
+eset <- readRDS(file.path(params$esetdir, "esetTINT.Rds"))
+pheno <- pData(eset)
+
+##Storage
+##All samples analyzed in 2021, patientid gives sample year
+pheno <- pheno |> mutate(storagetime=21-as.numeric(sub(".*-", "", pheno$patientid)))
+
+##Variance
+fData(eset)$var <-  apply(exprs(eset), 1, var)
+
+## Remove control probesets
+eset <- eset[!grepl("^AFFX|^ERCC|pos|neg", rownames(eset)),]
+## Keep only protein coding genes
+fData(eset) <- fData(eset) %>% mutate(protein=grepl("^protein-coding$", GENETYPE))
+esetp <- eset[fData(eset)$protein,]
+```
+
+## Description
+
+Investigate expression of activitry markers for CD3, CD8 and CD68 positive cells between high and low grade tumors.
+
+Compute gene expression ratios and compare these ratios (or rather the log2 ratios) between ISUP 3-5 and 1-2 in T, TINT-N and TINT-D. The ratios to investigate are:
+
+* PRF1, GZMB, GZMA, GNLY, CTLA-4, PD1, FAS, IFNG vs. CD3
+* PRF1, GZMB vs. CD8
+* CTLA-4 vs. CD4
+* CD163, IDO1, MRC1 (CD206), SPP1, PDL1 (CD274),  CXCL9, CXCL10, S100A9 vs. CD68
+
+
+## Methods
+
+For CD3 compute the mean value over CD3D and CD3E.
+
+For CD8 compute the mean value over CD8A and CD8B.
+
+Compute log2 ratios based on the RMA normalized data as the differences between log2 intensities.
+
+Associations between ISUP groups (3-5 vs 1-2) and log2-ratios are computed using linear mixed effects models with random intercept for patient. Two versions of the models are computed; one with only ISUP group, sample type (T, T1, T2) and the interaction ISUPgroup:sampletype and one that in addition include age and run.
+
+```{r ratios}
+fd <- fData(esetp) |> filter(SYMBOL %in% c("PRF1", "GZMB", "GZMA", "GNLY", "CTLA4", "PDCD1", "FAS", "IFNG", "CD3E", "CD3D", "CD8A", "CD8B", "CD4", "CD163", "IDO1", "MRC1", "SPP1", "CD274", "CXCL9", "CXCL10", "S100A9", "CD68", "CD3G"))
+
+X0 <- exprs(esetp[fd$PROBEID,])
+##Compute mean per SYMBOL
+spl <- split(fd$PROBEID, fd$SYMBOL)
+X0 <- sapply(spl, function(i) colMeans(X0[i, , drop=FALSE])) |> t()
+rownames(X0) <- names(spl)
+
+## Exclude CD3G AND compute mean per CD3 and CD8
+spl$CD3G <- NULL
+nms <- sub("CD8.*", "CD8", sub("CD3.*", "CD3", names(spl)))
+spl <- split(names(spl), nms)
+X <- sapply(spl, function(i) colMeans(X0[i, , drop=FALSE])) |> t()
+rownames(X) <- names(spl)
+
+pairs <- list(
+  PRF1_CD3   = c("PRF1",  "CD3"),
+  GZMB_CD3   = c("GZMB",  "CD3"),
+  GZMA_CD3   = c("GZMA",  "CD3"),
+  GNLY_CD3   = c("GNLY",  "CD3"),
+  CTLA4_CD3  = c("CTLA4", "CD3"),
+  PDCD1_CD3  = c("PDCD1", "CD3"),
+  FAS_CD3    = c("FAS",   "CD3"),
+  IFNG_CD3   = c("IFNG",  "CD3"),
+
+  PRF1_CD8   = c("PRF1",  "CD8"),
+  GZMB_CD8   = c("GZMB",  "CD8"),
+
+  CTLA4_CD4  = c("CTLA4", "CD4"),
+
+  CD163_CD68 = c("CD163", "CD68"),
+  IDO1_CD68  = c("IDO1",  "CD68"),
+  MRC1_CD68  = c("MRC1",  "CD68"),
+  SPP1_CD68  = c("SPP1",  "CD68"),
+  CD274_CD68 = c("CD274", "CD68"),
+  CXCL9_CD68 = c("CXCL9", "CD68"),
+  CXCL10_CD68= c("CXCL10","CD68"),
+  S100A9_CD68= c("S100A9","CD68")
+)
+
+ratios <- sapply(pairs, function(g) {
+  X[g[1], ] - X[g[2],]
+})
+```
+
+## Results
+
+### CD3 and CD8
+
+CD3 is represented on the array by CD3D, CD3E and CD3G. CD8 is represented by CD8A and CD8B.
+
+In the following analyses mean values will be used, for CD3 over CD3D and CD3E and for CD8 over CD8A and CD8B.
+
+An overview of how similar (or not similar) the values are is shown in @fig-CDpairs.
+
+```{r fig-CDpairs}
+#| fig-cap: "Scatter plots comparing the CD3 and CD8 genes. Pearson correlation coefficient is printed."
+library(GGally)
+ggpairs(as.data.frame(t(X0)) |> dplyr::select(starts_with(c("CD3", "CD8"))) |> rownames_to_column("sampleid") |> left_join(pheno, by="sampleid"), columns = 2:6, mapping=aes(color=sample.type, alpha=0.5))
+```
+
+### Ratio associations
+
+```{r lm}
+pheno <- pheno |> mutate(ISUPgr = factor(ISUP, levels=1:5, labels=rep(c("1-2", "3-5"), c(2,3))))
+
+ratiosl <- as.data.frame(ratios) |> rownames_to_column("sampleid") |> pivot_longer(-sampleid, names_to = "ratio") |> left_join(pheno, by="sampleid")
+
+forms <- c(ISUPnocovars=~ISUPgr*sample.type,
+           ISUPagerun=~ISUPgr*sample.type+age+run)      
+designs <- lapply(forms, function(f) {
+  des <- model.matrix(f, data=pheno)
+  colnames(des) <- make.names(colnames(des))
+  des
+})
+
+#dupcor <- duplicateCorrelation(X, design=designs$ISUPagerun, block=pheno$patientid)
+
+contrastISUP <- makeContrasts(
+  ISUP35vs12_T1 = ISUPgr3.5 + ISUPgr3.5.sample.typeT1,
+  ISUP35vs12_T2 = ISUPgr3.5 + ISUPgr3.5.sample.typeT2,
+  ISUP35vs12_T = ISUPgr3.5,
+  levels=designs$ISUPagerun)
+
+lmcontrast <- function(form, contrast, df) {
+  f <- lmer(form, data=df)
+  nm <- make.names(names(fixef(f)))
+  tidy(glht(f, linfct=t(contrast[nm, ])), test=univariate(), conf.int=TRUE)
+}
+
+res <- lapply(forms, function(form) ratiosl |> group_by(ratio) |> reframe(lmcontrast(form=update(form, value ~ . + (1|patientid)), contrast=contrastISUP, pick(everything()))))
+```
+
+```{r tabs}
+tabs <- lapply(res, function(r) r |> mutate(log2FC=sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high), p=adj.p.value) |> pivot_wider(id_cols = c(ratio), names_from=contrast, values_from = c(log2FC, p), names_vary = "slowest") |> relocate(ends_with("T"), .after=ratio) |> gt() |> tab_spanner(label="3-5 vs 1-2, T", columns=ends_with("ISUP35vs12_T")) |> tab_spanner(label="3-5 vs 1-2, TINT1", columns=ends_with("ISUP35vs12_T1")) |> tab_spanner(label="3-5 vs 1-2, TINT2", columns=ends_with("ISUP35vs12_T2")) |> cols_label_with(fn=~sub("log2FC", "log2FC (95% CI)", gsub("(.*)_.*_.*", "\\1", .))) |> fmt_number(decimal=3) |> 
+  tab_style(style = cell_fill(color = "#f4cccc"), locations = cells_body(columns = c(log2FC_ISUP35vs12_T1, p_ISUP35vs12_T1), rows = p_ISUP35vs12_T1 <= 0.05&log2FC_ISUP35vs12_T1>0)) |>
+  tab_style(style = cell_fill(color = "#cfe2f3"), locations = cells_body(columns = c(log2FC_ISUP35vs12_T1, p_ISUP35vs12_T1), rows = p_ISUP35vs12_T1 <= 0.05&log2FC_ISUP35vs12_T1<0)) |> 
+  tab_style(style = cell_fill(color = "#f4cccc"), locations = cells_body(columns = c(log2FC_ISUP35vs12_T2, p_ISUP35vs12_T2), rows = p_ISUP35vs12_T2 <= 0.05&log2FC_ISUP35vs12_T2>0)) |>
+  tab_style(style = cell_fill(color = "#cfe2f3"), locations = cells_body(columns = c(log2FC_ISUP35vs12_T2, p_ISUP35vs12_T2), rows = p_ISUP35vs12_T2 <= 0.05&log2FC_ISUP35vs12_T2<0)) |> 
+  tab_style(style = cell_fill(color = "#f4cccc"),locations = cells_body(columns = c(log2FC_ISUP35vs12_T, p_ISUP35vs12_T), rows = p_ISUP35vs12_T <= 0.05&log2FC_ISUP35vs12_T>0)) |>
+  tab_style(style = cell_fill(color = "#cfe2f3"), locations = cells_body(columns = c(log2FC_ISUP35vs12_T, p_ISUP35vs12_T), rows = p_ISUP35vs12_T <= 0.05&log2FC_ISUP35vs12_T<0)) )
+```
+
+```{r tbl-rationocovars}
+#| tbl-cap: "Association between ratios and ISUP 3-5 and 1-2. log2(fold change) with 95% confidence interval and p-value. No covariates in the model."
+tabs$ISUPnocovars
+```
+
+```{r tbl-ratioagerun}
+#| tbl-cap: "Association between ratios and ISUP 3-5 and 1-2. log2(fold change) with 95% confidence interval and p-value. Age and run are included as covariates in the model."
+  tabs$ISUPagerun
+```
+
