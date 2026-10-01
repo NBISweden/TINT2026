@@ -3,11 +3,20 @@ library(oligo)
 library(clariomdhumantranscriptcluster.db)
 library(affycoretools)
 
-params <- list(intermediate = '../../data/intermediate', esetdir='../../data/esets')
+params <- list(datadir = '../../data/TINT2026', intermediate = '../../data/TINT2026/intermediate', esetdir = '../../data/TINT2026/esets')
 
 ## Read combined metadata file which include name of dataset, celfile names, run (batch) information and clinical data
-meta <- readRDS(file.path(params$intermediate, "meta.Rds"))
-meta <- meta |> filter(dataset %in% c("TINT", "bombiopsi"))
+meta <- read_delim(file.path(params$datadir, "sdrf.tsv"), "\t")
+meta <- meta |> transmute(sampleid = `Source Name`, 
+  dataset = `Characteristics[collection method]`, 
+  patientid = `Characteristics[individual]`,
+  ISUPgr = `Characteristics[isup group]`,
+  age = `Characteristics[age]`,
+  run = `Characteristics[experimental run]`,
+  sampletype = `Characteristics[sample type]`,
+  disease = `Characteristics[disease]`) |> 
+  mutate(dataset2 = ifelse(dataset=="biopsy", ifelse(sampletype=="Bx-tumor", "Bxtumor", "Bxbenign"), dataset),
+          celfile = file.path(params$datadir, "CELS", paste0(sampleid, ".CEL")))
 
 ## Read cel files, RMA normalize and annotate
 readnormannot <- function(pheno) {
@@ -20,21 +29,14 @@ readnormannot <- function(pheno) {
 }
 
 ##Normalize separately per dataset
-esets <- meta |> group_by(dataset2) |> summarise(n=n(), eset=list(readnormannot(pick(everything()))))
-nms <- esets$dataset2
-esets <- esets$eset
-names(esets) <- nms
+esets <- list()
+esets$Bxbenign <- readnormannot(meta |> filter(dataset2=="Bxbenign"))
+esets$TINT <- readnormannot(meta |> filter(dataset2==TINT))
+##Normalize both biopsy datasets together
+esets[["biopsy"]] <- readnormannot(meta |> filter(dataset=="biopsy"))
+### Normalize radical prostatectomy and biopsies together
+esets[["TINTbiopsy"]] <- readnormannot(meta)
 
 for (nm in names(esets)){
   saveRDS(esets[[nm]], file.path(params$esetdir, paste0("eset", nm, ".Rds")))
 }
-
-##Normalize both bombiopsi datasets together
-esets[["bombiopsi"]] <- readnormannot(meta |> filter(dataset=="bombiopsi"))
-saveRDS(esets$bombiopsi, file.path(params$esetdir, paste0("eset", "bombiopsi", ".Rds")))
-
-### Normalize TINT and bombiopsi together
-esets[["TINTbombiopsi"]] <- readnormannot(meta)
-saveRDS(esets$TINTbombiopsi, file.path(params$esetdir, paste0("eset", "TINTbombiopsi", ".Rds")))
-
-

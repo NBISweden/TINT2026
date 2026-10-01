@@ -25,15 +25,10 @@ knitr:
 
 
 ```{r setup, include=FALSE}
-params <- list(
-  intermediate = '../../data/intermediate',
-  esetdir = '../../data/esets',
-  resultdir = "../../data/results",
-  clariomddir = "../../../clariomD/PA368/PA368")
-tab.path<- file.path(params$intermediate, "table")
-dir.create(tab.path, showWarnings = FALSE)
+params <- list(datadir = '../../data/TINT2026',
+intermediate = '../../data/TINT2026/intermediate',
+esetdir = '../../data/TINT2026/esets')
 ```
-
 
 ```{r libraries, include=FALSE}
 ## Data wrangling
@@ -66,30 +61,40 @@ library(clusterProfiler)
 library(broom)
 
 library(ComplexHeatmap)
+
+library(msigdbr)
+library(fgsea)
 ```
 
 ```{r colors}
-cols1 <- c("LumA"="#FF0000", "LumB"="#8000FF", "Basal"="#FFFF00", "Normal"="#00FFFF", "Tumor"="#0000FF", "Cancer, not tumor"="#FF0080", "TINT1"="#008000", "TINT2"="#808000", "Unclassified"="grey")
+cols1 <- c("LumA"="#FF0000", "LumB"="#8000FF", "Basal"="#FFFF00", "Normal"="#00FFFF", "Tumor"="#0000FF", "Cancer, not tumor"="#FF0080", "T1"="#008000", "T2"="#808000", "TINT-N"="#008000", "TINT-D"="#808000", "Unclassified"="grey")
 ```
 
 
 # Data
 
 ```{r prep}
-##Collect sample and patient information from various files
-#source("prepmetadata.R")
-## This script will save the meta data in meta.Rds
-
 ##Read cel files, normalize and annotate
 #source("TINTnormalize.R")
 ```
 
 ```{r meta}
-meta <- readRDS(file.path(params$intermediate, "meta.Rds"))
+meta <- read_delim(file.path(params$datadir, "sdrf.tsv"), "\t")
+meta <- meta |> transmute(sampleid = `Source Name`, 
+  dataset = `Characteristics[collection method]`, 
+  patientid = `Characteristics[individual]`,
+  ISUPgr = `Characteristics[isup group]`,
+  age = `Characteristics[age]`,
+  run = `Characteristics[experimental run]`,
+  sampletype = `Characteristics[sample type]`,
+  disease = `Characteristics[disease]`) |> 
+  mutate(dataset2 = ifelse(dataset=="biopsy", ifelse(sampletype=="Bx-tumor", "Bxtumor", "Bxbenign"), dataset),
+          celfile = file.path(params$datadir, "CELS", paste0(sampleid, ".CEL")),
+          cancer = 1*(sampletype %in% c("Bx-later-cancer", "Bx-tumor", "TINT-D", "TINT-N", "Tumor")),
+          tumor = 1*(grepl("[Tt]umor", sampletype)))
 meta <- meta |> mutate(typeCT=ifelse(tumor==1, "Tumor", ifelse(cancer==1, "Cancer, not tumor", "Normal")))
-
-## Storage time
-meta <- meta |> mutate(storagetime=ifelse(dataset=="TINT", 21-as.numeric(sub(".*-", "", patientid)), ifelse(dataset=="bombiopsi", 2023-as.numeric(ÅR), NA)))
+meta <- meta |> dplyr::select(sampleid, patientid, dataset, run, tumor, cancer, age, sampletype, ISUPgr, typeCT) |>
+  mutate(type = recode(sampletype, `TINT-D` = "T2", `TINT-N` = "T1", Tumor="T"))
 ```
 
 ```{r esets}
@@ -98,25 +103,24 @@ meta <- meta |> mutate(storagetime=ifelse(dataset=="TINT", 21-as.numeric(sub(".*
 
 ## Radical prostatectomy samples (T, TINT-N, TINT-D)
 eset <- readRDS(file.path(params$esetdir, "esetTINT.Rds"))
-pheno <- pData(eset)
+pheno <- pData(eset) |> left_join(meta)
 
 ## All biopsies Bx-tumor, Bx-later-tumor, Bx-normal-control.
-esetBx <- readRDS(file.path(params$esetdir, "esetbombiopsi.Rds"))
+esetBx <- readRDS(file.path(params$esetdir, "esetbiopsy.Rds"))
 
 ## Only Bx-later-tumor and Bx-normal-control
-esetBx1 <- readRDS(file.path(params$esetdir, "esetbombiopsi1.Rds"))
+esetBx1 <- readRDS(file.path(params$esetdir, "esetBxbenign.Rds"))
 
 ## TINT and biopsy datasets normalized together
-esetall <- readRDS(file.path(params$esetdir, "esetTINTbombiopsi.Rds"))
+esetall <- readRDS(file.path(params$esetdir, "esetTINTbiopsy.Rds"))
 phenoall <- pData(esetall) |> mutate(sampleid=colnames(esetall))## |> left_join(meta, by="sampleid")
-##phenoall <- pheno |> mutate(typeCT=ifelse(tumor==1, "Tumor", ifelse(cancer==1, "Cancer, not tumor", "Normal")))
+
+phenoall <- phenoall |> left_join(meta)
 ```
 
-```{r typeandstorage}
+```{r typeCT}
 phenoall <- phenoall |> mutate(typeCT=ifelse(tumor==1, "Tumor", ifelse(cancer==1, "Cancer, not tumor", "Normal")))
 pheno <- pheno |> mutate(typeCT=ifelse(tumor==1, "Tumor", ifelse(cancer==1, "Cancer, not tumor", "Normal")))
-##All samples analyzed in 2021, patientid gives sample year
-pheno <- pheno |> mutate(storagetime=21-as.numeric(sub(".*-", "", pheno$patientid)))
 ```
 
 `r ncol(eset)` samples are analyzed on the clariom D array in `r length(unique(pheno$run))` runs/batches. `r nrow(eset)` probesets are analyzed of which `r sum(!is.na(Biobase::fData(eset)$GENETYPE)&Biobase::fData(eset)$GENETYPE=="protein-coding")` are protein coding genes.
@@ -159,7 +163,7 @@ exprs(esetallbc) <- removeBatchEffect(esetall, batch=phenoall$dataset, design=mo
 
 Principal component analysis (PCA), implemented in the R package `ropls`[@ropls], is performed to give a visual overview of the data.
 
-Differential gene expression analyses were performed using `limma` [@limma]. Multiple samples from the same patient were handled using the `duplicateCorrelation` function. Linear models with the following terms are computed; ISUP group (1-2 or 3-5), sample type (tumor, TINT1 or TINT2), the interaction ISUP group:sample type as well as age and run (batch). Contrasts are then computed to investigate ...
+Differential gene expression analyses were performed using `limma` [@limma]. Multiple samples from the same patient were handled using the `duplicateCorrelation` function. Linear models with the following terms are computed; ISUP group (1-2 or 3-5), sample type (tumor, TINT-N or TINT-D), the interaction ISUP group:sample type as well as age and run (batch). Contrasts are then computed to investigate ...
 
 Separate models are performed where also normal tissue is included.
 
@@ -190,14 +194,14 @@ pctype.scale <- intrinsic.cluster.predict(sbt.model = pam50.scale.pc, data = t(s
 
 pam50 <- data.frame(sampleid=names(pctype.scale$subtype), pam50=pctype.scale$subtype, pctype.scale$subtype.proba, cor=pctype.scale$cor)
 
-Tpam50 <- pam50|>left_join(pheno|>dplyr::select(sampleid, patientid, sample.type))|>filter(sample.type=="T") |> dplyr::select(-sampleid, -sample.type) |> rowwise() |> mutate(cor=max(cor.Basal, cor.LumA, cor.LumB)) |> rename_with(~paste0("T", .), -patientid)
+Tpam50 <- pam50|>left_join(pheno|>dplyr::select(sampleid, patientid, sampletype))|>filter(sampletype=="Tumor") |> dplyr::select(-sampleid, -sampletype) |> rowwise() |> mutate(cor=max(cor.Basal, cor.LumA, cor.LumB)) |> rename_with(~paste0("T", .), -patientid)
 
 pheno <- pheno |> left_join(Tpam50, by="patientid")
 phenoall <- phenoall |> left_join(Tpam50, by="patientid")
 # ##PAM50 in T samples
-# pheno <- pheno |> group_by(patientid) |> mutate(Tpam50=pam50[sample.type=="T"]) |> ungroup()
+# pheno <- pheno |> group_by(patientid) |> mutate(Tpam50=pam50[sampletype=="Tumor]) |> ungroup()
 # ##PAM50 fractions
-# pheno <- pheno |> group_by(patientid) |> mutate(TLumA=LumA[sample.type=="T"], TLumB=LumB[sample.type=="T"], TBasal=Basal[sample.type=="T"]) |> ungroup()
+# pheno <- pheno |> group_by(patientid) |> mutate(TLumA=LumA[sampletype=="Tumor], TLumB=LumB[sampletype=="Tumor], TBasal=Basal[sampletype=="Tumor]) |> ungroup()
 ```
 
 ## Principal component analysis
@@ -223,7 +227,7 @@ pcploteset <- function(E, ph=NULL, pcs=1:2, scoretext=FALSE, loadtype="point", a
   pc <- opls(t(E), predI=npc, fig.pdfC='none', info.txtC='none')
   pcnames <- sprintf("PC%d (%2.0f%%)", pcs, pc@modelDF[pcs, "R2X"] * 100)
   nmpcs <- paste0("p", pcs)
-  plscore <- ggplot(data.frame(pc@scoreMN, ph), aes(x=!!as.symbol(nmpcs[1]),y=!!as.symbol(nmpcs[2]), color=sample.type, label=sampleid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw()+ geom_point() + geom_text_repel() ## + theme(legend.position=c(1,1), legend.justification=c(1,1), legend.background =element_rect(fill="transparent")) 
+  plscore <- ggplot(data.frame(pc@scoreMN, ph), aes(x=!!as.symbol(nmpcs[1]),y=!!as.symbol(nmpcs[2]), color=sampletype, label=sampleid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw()+ geom_point() + geom_text_repel() ## + theme(legend.position=c(1,1), legend.justification=c(1,1), legend.background =element_rect(fill="transparent")) 
   if (is.character(scoretext) & scoretext=="all") {
     plscore <- plscore +  geom_text_repel(aes(label=sampleid), show.legend = FALSE)
   } else if (is.numeric(scoretext)) {
@@ -237,11 +241,11 @@ pcploteset <- function(E, ph=NULL, pcs=1:2, scoretext=FALSE, loadtype="point", a
     plload <- ggplot(data.frame(pc@loadingMN, label=rownames(pc@loadingMN), aa[match(rownames(pc@loadingMN), aa$PROBEID),]), aes(x=!!as.symbol(nmpcs[1]), y=!!as.symbol(nmpcs[2]), label=SYMBOL)) + xlab(pcnames[1]) + ylab(pcnames[2]) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + theme_bw() + geom_text()
   list(pc=pc, plscore=plscore, plload=plload)
 }
-pcplot <- function(pc, ph, pcs=1:2, scoretext=FALSE, loadtype="point", color="sample.type", shape="sample.type") {
+pcplot <- function(pc, ph, pcs=1:2, scoretext=FALSE, loadtype="point", color="type", shape="type") {
   pcnames <- sprintf("PC%d (%2.0f%%)", pcs, pc@modelDF[pcs, "R2X"] * 100)
   nmpcs <- paste0("p", pcs)
   df <- pc@scoreMN |> as.data.frame() |> rownames_to_column("sampleid") |> left_join(pheno, by="sampleid")
-  df |> ggplot(aes(x=p1, y=p2, color=sample.type, label=sampleid)) + geom_point() + geom_text_repel()
+  df |> ggplot(aes(x=p1, y=p2, color=sampletype, label=sampleid)) + geom_point() + geom_text_repel()
   plscore <- df |> ggplot(aes(x=!!as.symbol(nmpcs[1]),y=!!as.symbol(nmpcs[2]), color=.data[[color]], shape=.data[[shape]], label=sampleid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + geom_point()
   if (is.character(scoretext) & scoretext=="all") {
     plscore <- plscore +  geom_text_repel(aes(label=sampleid), show.legend = FALSE)
@@ -273,8 +277,8 @@ plprot <- pcploteset(esetp, pheno)
 iddev <- rownames(plprot$plscore$data) [plprot$plscore$data$p2<(-100)]
 
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plall$pc@modelDF[, "R2X"] * 100)
-ggplot(plall$plscore$data, aes(x=p1, y=p2, color=run, shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line()
-ggplot(plall$plscore$data, aes(x=p1, y=p2, color=sample.type, shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
+ggplot(plall$plscore$data, aes(x=p1, y=p2, color=run, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line()
+ggplot(plall$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
 ```
 
 ```{r fig-PCAprot}
@@ -283,7 +287,6 @@ ggplot(plall$plscore$data, aes(x=p1, y=p2, color=sample.type, shape=sample.type,
 #|  - "Protein coding. Sample type. PC1 and PC2."
 #|  - "Protein coding. Sample type. PC1 and PC3."
 #|  - "Protein coding. Run. PC1 and PC3."
-#|  - "protein coding. Storage time."
 #|  - "Protein coding. ISUP. PC1 and PC3."
 #|  - "Protein coding. ISUP. PC1 and PC3. Samples from the same patient are marked by a colored background area."
 #|  - "Protein coding. PAM50. PC1 and PC3. Colored according to class in tumor sample, size of the dot according to correlation to subtype."
@@ -294,7 +297,7 @@ ggplot(plall$plscore$data, aes(x=p1, y=p2, color=sample.type, shape=sample.type,
 #| layout-ncol: 2
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plprot$pc@modelDF[, "R2X"] * 100)
 
-plprot$plscore$data <- plprot$plscore$data |> mutate("Sample type"=factor(sample.type, levels=c("T", "T1", "T2"), labels=c("Tumor", "TINT-N", "TINT-D")))
+plprot$plscore$data <- plprot$plscore$data |> mutate("Sample type"=factor(sampletype, levels=c("Tumor", "TINT-N", "TINT-D")))
 
 ##PC12 sample type
 pl <- ggplot(plprot$plscore$data, aes(x=p1, y=p2, color=`Sample type`, shape=`Sample type`, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
@@ -304,14 +307,12 @@ pl + geom_text(data=plprot$plscore$data[iddev,], aes(label=sampleid), nudge_x=0.
 ggplot(plprot$plscore$data, aes(x=p1, y=p3, color=`Sample type`, shape=`Sample type`, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
 ##PC13 batch
 ggplot(plprot$plscore$data, aes(x=p1, y=p3, color=run, shape=`Sample type`, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line()
-## PC13 storage time
-ggplot(plprot$plscore$data, aes(x=p1, y=p3, color=storagetime, shape=`Sample type`, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_viridis_c(option =  "E")
 
 ##PC13 ISUP
-ggplot(plprot$plscore$data|>mutate(ISUP=factor(ISUP)), aes(x=p1, y=p3, color=ISUP, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=`Sample type`), size=2.5) + geom_line() + scale_color_discrete("Tumor grade (ISUP)")
+ggplot(plprot$plscore$data, aes(x=p1, y=p3, color=ISUPgr, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=`Sample type`), size=2.5) + geom_line() + scale_color_discrete("Tumor grade (ISUP)")
 
-pl <- plprot$plscore$data |> mutate(ISUP=factor(ISUP)) |> ggplot(aes(x=p1, y=p3, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent"))
-pl + geom_polygon(data=pl$data |> group_by(patientid) |> reframe(pick(everything())[chull(p1, p3),]), aes(group=patientid, fill=ISUP), alpha=0.3) + geom_point(aes(shape=`Sample type`, color=ISUP), size=2.5)
+pl <- plprot$plscore$data |> ggplot(aes(x=p1, y=p3, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent"))
+pl + geom_polygon(data=pl$data |> group_by(patientid) |> reframe(pick(everything())[chull(p1, p3),]), aes(group=patientid, fill=ISUPgr), alpha=0.3) + geom_point(aes(shape=`Sample type`, color=ISUPgr), size=2.5)
 
 
 ##PC13 PAM50
@@ -347,7 +348,6 @@ Principal component analysis (PCA) is performed based on all protein coding tran
 #|  - "Protein coding. Sample type. PC1 and PC3."
 #|  - "Protein coding. Run. PC1 and PC3."
 #|  - "Protein coding. ISUP. PC1 and PC3."
-#|  - "Protein coding. Storage time. PC1 and PC3."
 #|  - "Protein coding. PAM50. PC1 and PC3. Colored according to class in tumor sample, size of the dot according to correlation to subtype."
 #|  - "Protein coding. PAM50. PC1 and PC3. Colored according to class in tumor sample."
 #|  - "Protein coding. PAM50. PC1 and PC3. Colored according to class in tumor sample. Samples from the same patient are marked by a colored background area."
@@ -360,33 +360,29 @@ Principal component analysis (PCA) is performed based on all protein coding tran
 
 ##All transcripts
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plallnobatch$pc@modelDF[, "R2X"] * 100)
-ggplot(plallnobatch$plscore$data, aes(x=p1, y=p2, color=factor(ISUP), shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
+ggplot(plallnobatch$plscore$data, aes(x=p1, y=p2, color=ISUPgr, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
 
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plprotnobatch$pc@modelDF[, "R2X"] * 100)
 
-plprotnobatch$plscore$data <- plprotnobatch$plscore$data |> mutate("Sample type"=factor(sample.type, levels=c("T", "T1", "T2"), labels=c("Tumor", "TINT-N", "TINT-D")))
 ##Protein coding transcripts
 ##PC12 sample type
-pl <- ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p2, color=sample.type, shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
+pl <- ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
 pl + geom_text(data=plprotnobatch$plscore$data[iddev,], aes(label=sampleid), nudge_x=0.5, nudge_y=0.5)
 
 ##PC13 sample type
-ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=sample.type, shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
+ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=sampletype, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line(color="grey")
 ##PC13 batch
-ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=run, shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line()
+ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=run, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line()
 ##PC13 ISUP
-ggplot(plprotnobatch$plscore$data|>mutate(ISUP=factor(ISUP)), aes(x=p1, y=p3, color=ISUP, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=sample.type), size=2.5) + geom_line()
-
-## PC13 storage time
-ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=storagetime, shape=`Sample type`, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_viridis_c(option =  "E")
+ggplot(plprotnobatch$plscore$data, aes(x=p1, y=p3, color=ISUPgr, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=sampletype), size=2.5) + geom_line()
 
 ##PC13 PAM50
-plprotnobatch$plscore$data  |> ggplot(aes(x=p1, y=p3, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(size=Tcor, shape=sample.type)) + geom_line() + scale_color_viridis_d()
+plprotnobatch$plscore$data  |> ggplot(aes(x=p1, y=p3, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(size=Tcor, shape=sampletype)) + geom_line() + scale_color_viridis_d()
 
-plprotnobatch$plscore$data |> ggplot(aes(x=p1, y=p3, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=`Sample type`)) + geom_line() + scale_color_viridis_d()
+plprotnobatch$plscore$data |> ggplot(aes(x=p1, y=p3, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=sampletype)) + geom_line() + scale_color_viridis_d()
 ##polygon instead of lines
 pl <- plprotnobatch$plscore$data |> ggplot(aes(x=p1, y=p3, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[3]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent"))
-pl + geom_polygon(data=pl$data |> group_by(patientid) |> reframe(pick(everything())[chull(p1, p3),]), aes(group=patientid, fill=Tpam50), alpha=0.3) + scale_fill_viridis_d() + geom_point(aes(shape=`Sample type`, color=Tpam50), size=2.5) + scale_color_viridis_d()
+pl + geom_polygon(data=pl$data |> group_by(patientid) |> reframe(pick(everything())[chull(p1, p3),]), aes(group=patientid, fill=Tpam50), alpha=0.3) + scale_fill_viridis_d() + geom_point(aes(shape=sampletype, color=Tpam50), size=2.5) + scale_color_viridis_d()
 
 ## Loading plots
 plprotnobatch$plload$data |> ggplot(aes(x=p1, y=p2))  + xlab(pcnames[1]) + ylab(pcnames[2]) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + theme_bw() + geom_point(pch=".") + geom_text_repel(data=plprot$plload$data |> left_join(fData(esetp), by=c(label="PROBEID")) |> mutate(r1=rank(-abs(p1)), r3=rank(-abs(p3))) |> filter(r1<6|r3<6) , aes(label=SYMBOL), size=3)
@@ -400,16 +396,20 @@ plprotnobatch$plload$data |> ggplot(aes(x=p1, y=p3))  + xlab(pcnames[1]) + ylab(
 ##Protein coding
 esetBxp <- esetBx[grepl("^protein-coding$", featureData(esetBx)$GENETYPE), ]
 esetBx1p <- esetBx[grepl("^protein-coding$", featureData(esetBx1)$GENETYPE), ]
-phBx <- meta |> filter((dataset=="bombiopsi"))
+phBx <- meta |> filter((dataset=="biopsy")) |> mutate(sampletype=factor(sampletype, levels=c("Bx-tumor", "Bx-later-cancer", "Bx-control")))
+```
 
-phBx <- phBx |> mutate(type = factor(if_else(cancer==0, "normal", if_else(tumor==0, "latercancer", "tumor")), levels=c("normal", "latercancer", "tumor")))
+```{r Savenormalizedprotein}g
+write.csv(exprs(esetp), file=file.path(params$intermediate, "TINT_normalized.csv"))
+write.csv(exprs(esetBxp), file=file.path(params$intermediate, "Biopsy_normalized.csv"))
 ```
 
 ```{r BxPCA}
 idBx <- phBx |> pull(sampleid)
-idBxLCN <- phBx |> filter(type %in% c("normal", "latercancer")) |> pull(sampleid)
+idBxLCN <- phBx |> filter(sampletype %in% c("Bx-control", "Bx-later-cancer")) |> pull(sampleid)
 
-rownames(phBx) <- phBx$sampleid
+phBx <- as.data.frame(phBx)
+rownames(phBx) <- phBx$sampleid 
 
 plBx <- pcploteset(esetBx[, idBx], ph=phBx[idBx,]) 
 plBxprot <- pcploteset(esetBxp[, idBx], ph=phBx[idBx,])
@@ -428,13 +428,13 @@ plBx1prot <- pcploteset(esetBx1p[, idBxLCN], ph=phBx[idBxLCN,])
 
 ##All transcripts
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plBx$pc@modelDF[, "R2X"] * 100)
-ggplot(plBx$plscore$data, aes(x=p1, y=p2, color=type, shape=type)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
-ggplot(plBx$plscore$data, aes(x=p3, y=p4, color=type, shape=type)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx$plscore$data, aes(x=p3, y=p4, color=sampletype, shape=sampletype)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
 
 ##Protein coding
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plBxprot$pc@modelDF[, "R2X"] * 100)
-ggplot(plBxprot$plscore$data, aes(x=p1, y=p2, color=type, shape=type)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
-ggplot(plBxprot$plscore$data, aes(x=p3, y=p4, color=type, shape=type)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBxprot$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBxprot$plscore$data, aes(x=p3, y=p4, color=sampletype, shape=sampletype)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
 ```
 ```{r fig-PCAbombiopsi1}
 #| fig-cap: "PCA based on **biopsies**, normal and later cancer."
@@ -445,12 +445,12 @@ ggplot(plBxprot$plscore$data, aes(x=p3, y=p4, color=type, shape=type)) + xlab(pc
 #|  - "Protein coding transcripts, PC3 and PC4"
 #| layout-ncol: 2
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plBx1$pc@modelDF[, "R2X"] * 100)
-ggplot(plBx1$plscore$data, aes(x=p1, y=p2, color=type, shape=type)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
-ggplot(plBx1$plscore$data, aes(x=p3, y=p4, color=type, shape=type)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx1$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx1$plscore$data, aes(x=p3, y=p4, color=sampletype, shape=sampletype)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
 
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, plBx1prot$pc@modelDF[, "R2X"] * 100)
-ggplot(plBx1prot$plscore$data, aes(x=p1, y=p2, color=type, shape=type)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
-ggplot(plBx1prot$plscore$data, aes(x=p3, y=p4, color=type, shape=type)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx1prot$plscore$data, aes(x=p1, y=p2, color=sampletype, shape=sampletype)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
+ggplot(plBx1prot$plscore$data, aes(x=p3, y=p4, color=sampletype, shape=sampletype)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point()
 ```
 
 ### TINT and bombiopsi
@@ -502,14 +502,14 @@ ggplot(pcbcp$plscore$data, aes(x=p1, y=p2, color=typeCT, shape=dataset)) + xlab(
 ggplot(pcbcp$plscore$data, aes(x=p3, y=p4, color=typeCT, shape=dataset)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + scale_shape_manual(values=c(19,4))
 
 ##ISUP (for TINT)
-ggplot(pcbcp$plscore$data, aes(x=p3, y=p4, color=ifelse(is.na(ISUP), typeCT, ISUP), shape=dataset)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + scale_shape_manual(values=c(19,4))
+ggplot(pcbcp$plscore$data, aes(x=p3, y=p4, color=ifelse(is.na(ISUPgr), typeCT, ISUPgr), shape=dataset)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + scale_shape_manual(values=c(19,4))
 
 ##PAM50 (for TINT)
 ggplot(pcbcp$plscore$data, aes(x=p3, y=p4, color=ifelse(is.na(Tpam50), typeCT, Tpam50), shape=dataset)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + scale_shape_manual(values=c(19,4)) + scale_color_manual("PAM50", values=cols1)
 ```
 
 ```{r fig-PCAall2TINTNormal}
-#| fig-cap: "PCA of normal tisue (bombiopsi, no cancer) and tumor, T1 and T2. After batch correction."
+#| fig-cap: "PCA of normal tisue (Bx-control) and tumor, TINT-N and TINT-D. After batch correction."
 #| fig-subcap:
 #|  - "PC1 vs PC2, ISUP"
 #|  - "PC3 and PC4, ISUP"
@@ -517,97 +517,32 @@ ggplot(pcbcp$plscore$data, aes(x=p3, y=p4, color=ifelse(is.na(Tpam50), typeCT, T
 #|  - "PC1 vs PC2, PAM50"
 #| layout-ncol: 2
 ##TINT dataset and normal
-ph <- phenoall# |> filter(dataset=="TINT"|typeCT=="Normal") |> mutate(sample.type=if_else(is.na(sample.type), typeCT, sample.type)) |> column_to_rownames("sampleid")
+ph <- phenoall
 pcNandTINT <- pcploteset(esetallbc[,ph$sampleid], ph=ph)
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, pcNandTINT$pc@modelDF[, "R2X"] * 100)
-ggplot(pcNandTINT$plscore$data, aes(x=p1, y=p2, color=factor(ISUP), shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
-ggplot(pcNandTINT$plscore$data, aes(x=p3, y=p4, color=factor(ISUP), shape=sample.type, group=patientid)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
+ggplot(pcNandTINT$plscore$data, aes(x=p1, y=p2, color=ISUPgr, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
+ggplot(pcNandTINT$plscore$data, aes(x=p3, y=p4, color=ISUPgr, shape=sampletype, group=patientid)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
 
-pcNandTINT$plscore$data |> mutate(cor=ifelse(sample.type=="Normal", 0.2, Tcor)) |> ggplot(aes(x=p1, y=p2, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(size=Tcor, shape=sample.type)) + geom_line() + scale_color_viridis_d()
-pcNandTINT$plscore$data |> mutate(cor=ifelse(sample.type=="Normal", 0.2, Tcor)) |> ggplot(aes(x=p1, y=p2, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=sample.type)) + geom_line() + scale_color_viridis_d()
+pcNandTINT$plscore$data |> mutate(cor=ifelse(sampletype=="Bx-control", 0.2, Tcor)) |> ggplot(aes(x=p1, y=p2, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(size=Tcor, shape=sampletype)) + geom_line() + scale_color_viridis_d()
+pcNandTINT$plscore$data |> mutate(cor=ifelse(sampletype=="Bx-control", 0.2, Tcor)) |> ggplot(aes(x=p1, y=p2, color=Tpam50, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point(aes(shape=sampletype)) + geom_line() + scale_color_viridis_d()
 ```
 
 
 ```{r fig-PCAall2TINTNormalLC}
-#| fig-cap: "PCA of normal tisue (bombiopsi, no cancer or later cancer) and tumor, T1 and T2. After batch correction."
+#| fig-cap: "PCA of normal tisue (Bx-control or Bx-later-cancer) and tumor, TINT-N and TINT-D. After batch correction."
 #| fig-subcap:
 #|  - "PC1 vs PC2"
 #|  - "PC3 and PC4"
 #| layout-ncol: 2
 ##TINT dataset and normal
-ph <- meta |> filter(dataset=="TINT"|(dataset=="bombiopsi"&(typeCT%in%c("Normal", "Cancer, not tumor")))) |> mutate(sample.type=if_else(is.na(sample.type), typeCT, sample.type)) |> column_to_rownames("sampleid")
+ph <- meta |> filter(dataset=="radical prostatectomy"|(dataset=="biopsy"&(typeCT%in%c("Normal", "Cancer, not tumor")))) |> column_to_rownames("sampleid")
 id <- rownames(ph) 
 pcBandTINT <- pcploteset(esetallbc[,id], ph=ph)
 pcnames <- sprintf("PC%d (%2.0f%%)", 1:4, pcBandTINT$pc@modelDF[, "R2X"] * 100)
-ggplot(pcBandTINT$plscore$data, aes(x=p1, y=p2, color=factor(ISUP), shape=sample.type, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
-ggplot(pcBandTINT$plscore$data, aes(x=p3, y=p4, color=factor(ISUP), shape=sample.type, group=patientid)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
-```
-## Storage time
-
-Storage time is computed as the number of years since the sample was taken until the RNA extraction (2021 for TINT and 2023 for Bx). Storage time is included as a covariate in the models, either as a continuous variable or as three groups (0-5 years, 6-10 years and >10 years). The groupings are based on the distribution of storage time in the samples.
-
-```{r fig-storage}
-#| fig-cap: "Storage time in tumor samples."
-#| fig-subcap:
-#|  - Normal and ISUP groups in tumor samples
-#|  - PAM50 groups in tumor samples
-#|  - LumA and storage time in tumor samples
-##For TINT and normal
-phenoall |> filter(sample.type=="T"|typeCT=="Normal") |> mutate(group=if_else(typeCT=="Normal", "Normal", paste("ISUP", ISUP))) |> ggplot(aes(x=group, y=storagetime)) + geom_boxplot(outlier.color=NA) + geom_quasirandom() + xlab("ISUP") + theme_bw()
-
-pheno |> filter(sample.type=="T") |> ggplot(aes(x=Tpam50, y=storagetime)) + geom_boxplot(outlier.color=NA) + geom_quasirandom() + xlab("PAM50") + theme_bw()
-
-pheno |> filter(sample.type=="T") |> ggplot(aes(x=TLumA, y=storagetime)) + geom_point() + geom_density_2d_filled(alpha=0.4) + theme_bw() + theme(legend.position="none") 
+ggplot(pcBandTINT$plscore$data, aes(x=p1, y=p2, color=ISUPgr, shape=sampletype, group=patientid)) + xlab(pcnames[1]) + ylab(pcnames[2]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
+ggplot(pcBandTINT$plscore$data, aes(x=p3, y=p4, color=ISUPgr, shape=sampletype, group=patientid)) + xlab(pcnames[3]) + ylab(pcnames[4]) + theme_bw() + theme(legend.position="right", legend.background =element_rect(fill="transparent")) + geom_point() + geom_line() + scale_color_discrete("ISUP")
 ```
 
-### Detection above background
-
-TAC reports a p-value for being above background for each measurement. Below the proportion of probesets with pDABG<0.05 is plotted vs storage time.
-
-```{r figDABG}
-##| fig-cap: "Proportion of probesets with detection above background (DABG) (<0.05) versus sample storage time (in years)."
-##| fig-subcap:
-##|  - "All probesets"
-##|  - "Only probesets annotated to protein coding genes"
-dabgfile <- file.path(params$clariomddir, "DABG.Rds")
-DABG <- readRDS(dabgfile)
-stopifnot(rownames(DABG)==rownames(eset))
-df <- data.frame(id=sub("(.*)\\.sst.*", "\\1", colnames(DABG)), dDABG=colMeans(DABG<0.05), mDABG=apply(DABG, 2, median), dprotDABG=colMeans(DABG[rownames(esetp),]<0.05), mprotDABG=apply(DABG[fData(esetp)$protein,], 2, median))
-#DABG |> as.data.frame() |> rownames_to_column("PROBEID") |> pivot_longer(-PROBEID, names_to = "dagbfile", values_to = "DABG")
-#df <- df |> mutate(id=sub("(.*)\\.sst.*", "\\1", dagbfile))
-
-pheno <- pheno |> mutate(id=sub("(.*)\\.CEL", "\\1", filename)) 
-df <- df |> left_join(pheno |> dplyr::select(sampleid, id, ISUP, storagetime), by=c("id"))
-#dfsum <- df |> group_by(sampleid, storagetime, ISUP) |> dplyr::summarize(n=sum(DABG<0.05), md=median(DABG)) 
-```
-
-::: {#fig-DABG layout-ncol=2}
-
-```{r fig-DABGall}
-#| fig-cap: "All probesets."
-df |> ggplot(aes(x=storagetime, y=dDABG)) + geom_point() + geom_smooth(method="lm") + theme_bw() + ylab("Proportion of probesets with DABG<0.05") + stat_cor(label.x=12)
-```
-
-```{r fig-DABGprotein}
-#| fig-cap: "Only probesets annotated to protein coding genes"
-df |> ggplot(aes(x=storagetime, y=dprotDABG)) + geom_point() + geom_smooth(method="lm") + theme_bw() + ylab("Proportion of probesets with DABG<0.05") + stat_cor(label.x=12) 
-```
-
-Proportion of probesets with detection above background (DABG) (<0.05) versus sample storage time (in years).
-:::
-
-### Pos vs Neg AUC
-
-Another measure used to classify samples ass Pass or not by TAC is the Pos vs neg AUC.
-
-```{r fig-QC}
-#| fig-cap: "Storage time in the samples classified as Out or Pass by TAC's pos vs neg AUC."
-PA368 <- read_delim("../../../clariomD/PA368/PA368/results/Info_samples.txt")
-PA368 <- PA368 |> mutate(id=sub("(.*)\\.sst.*", "\\1", `File Name`))
-df <- df |> left_join(PA368, by=c("id"))
-library(ggpubr)
-df |> ggplot(aes(x=`Pos vs Neg AUC Threshold`, y=storagetime)) + geom_boxplot() + geom_quasirandom() + stat_compare_means() + ylim(c(0,18)) 
-```
 
 
 ## Associations/Differential expression/Linear regression
@@ -615,7 +550,7 @@ df |> ggplot(aes(x=`Pos vs Neg AUC Threshold`, y=storagetime)) + geom_boxplot() 
 
 ```{r tbl-Nsamples}
 #| tbl-cap: "Number of samples in the different sample types."
-pheno |> group_by(sample.type) |> dplyr::summarize(n=n()) |> gt() 
+pheno |> group_by(sampletype) |> dplyr::summarize(n=n()) |> gt() 
 ```
 
 
@@ -625,16 +560,16 @@ Association models (linear regressions) are performed using limma. For models wi
 
 A set of different models are constructed;
 
-1. **T/T1/T2 and ISUP** - This is the main model, where the association between ISUP and sample types and gene expression are studied. The model is adjusted for age, run. Based on only the TINT data set.  `~ISUPgr*sample.type+covariates`
-Covariate sets: no covariates; age and run; and age, run and storage time.
-2. **T/T1/T2 and ISUP, all data sets** - Includes also normal tissue, compared T/T1/T2 to normal. Based on the TINT data set and the normal samples (bombiopsi). `~0+typeISUP+covariates`
-The model is adjusted for: age; age and storage time.
-3. **PAM50** - The association between PAM50 classification in tumor sample and gene expression is studied. Based on only the TINT data set. `~Tpam50*sample.type+ISUPgr+covariates`
-The model is adjusted for: no covariates; age and run; age, run and ISUP (1-2 vs 3-5); age, run and storage time; or age, run, storage time and ISUP (1-2 vs 3-5).
-   - **PAM50 fraction** - The PAM50 fraction is used as a covariate in the model. Based on only the TINT data set. `~1+(TLumA+TLumB)*sample.type+ISUPgr+covariates`
-   The model is adjusted for: no covariates; age and run; age, run and ISUP (1-2 vs 3-5); age, run and storage time; or age, run, storage time and ISUP (1-2 vs 3-5).
+1. **Tumor/TINT-N/TINT-D and ISUP** - This is the main model, where the association between ISUP and sample types and gene expression are studied. The model is adjusted for age, run. Based on only the TINT data set.  `~ISUPgr*sampletype+covariates`
+Covariate sets: no covariates or age and run.
+2. **Tumor/TINT-N/TINT-D and ISUP, all data sets** - Includes also normal tissue, compared Tumor/TINT-N/TINT-D to normal. Based on the TINT data set and the normal samples (bombiopsi). `~0+typeISUP+covariates`
+The model is adjusted for: age.
+3. **PAM50** - The association between PAM50 classification in tumor sample and gene expression is studied. Based on only the TINT data set. `~Tpam50*type+ISUPgr+covariates`
+The model is adjusted for: no covariates; age and run; or age, run and ISUP (1-2 vs 3-5).
+   - **PAM50 fraction** - The PAM50 fraction is used as a covariate in the model. Based on only the TINT data set. `~1+(TLumA+TLumB)*type+ISUPgr+covariates`
+   The model is adjusted for: no covariates; age and run; or age, run and ISUP (1-2 vs 3-5).
    - **PAM50 vs normal** - The PAM50 classification in tumor samples is compared to the PAM50 classification in normal samples. Based on all TINT data set and the normal samples (bombiopsi). `~0+typePAM50+covariates`
-   The model is adjusted: age; or age and storage time.
+   The model is adjusted for: age.
 
 
 ```{r designs}
@@ -642,29 +577,18 @@ The model is adjusted for: no covariates; age and run; age, run and ISUP (1-2 vs
 ## (i) an ISUP model comparing sample ISUP status (a combination of ISUP group (1-2 vs. 3-5) and sample type (Tumor, TINT-N, or TINT-D), resulting in six categories (Tumor 1-2, TINT-N 1-2, TINT-D 1-2, Tumor 3-5, TINT-N 3-5, TINT-D 3-5) and adjusted for age and run (batch);
 ## (ii) a PAM50 model comparing sample PAM50 status (a combination of PAM50 classification (LumA, LumB, Basal) and sample type (Tumor, TINT-N or TINT-D)), adjusted for age and run; and 
 ### (iii) a PAM50 model adjusted for ISUP: same as PAM50 model, but adjusted for age, run, and ISUP status.
-pheno <- pheno %>% mutate(ISUPgr = factor(ISUP, levels=1:5, labels=rep(c("1-2", "3-5"), c(2,3))))
-pheno <- pheno |> mutate(storagegr=cut(storagetime, c(0,5,10,20)))
+pheno <- as.data.frame(pheno) |> mutate(sampletype=factor(sampletype, levels=c("Tumor", "TINT-N", "TINT-D")))
 rownames(pheno) <- pheno$sampleid
 
 forms <- designs <- list()
-forms <- c(ISUPnocovars=~ISUPgr*sample.type,
-           ISUPagerun=~ISUPgr*sample.type+age+run,
-           ISUPstorageagerun=~ISUPgr*sample.type+storagetime+age+run,
-           ISUPstoragegragerun=~ISUPgr*sample.type+storagegr+age+run,
-           PAM50nocovars=~Tpam50*sample.type,
-           PAM50agerun=~Tpam50*sample.type+age+run, 
-           PAM50ISUPagerun=~Tpam50*sample.type+ISUPgr+age+run,
-           PAM50storageagerun=~Tpam50*sample.type+storagegr+age+run, 
-           PAM50storageISUPagerun=~Tpam50*sample.type+storagegr+ISUPgr+age+run,
-           PAM50storagegragerun=~Tpam50*sample.type+storagegr+age+run, 
-           PAM50storagegrISUPagerun=~Tpam50*sample.type+storagegr+ISUPgr+age+run,
-           PAM50fnocovars=~(TLumA+TLumB)*sample.type,
-           PAM50fagerun=~(TLumA+TLumB)*sample.type+age+run, 
-           PAM50fISUPagerun=~(TLumA+TLumB)*sample.type+ISUPgr+age+run,
-           PAM50fstorageagerun=~(TLumA+TLumB)*sample.type+storagetime+age+run, 
-           PAM50fstorageISUPagerun=~(TLumA+TLumB)*sample.type+storagetime+ISUPgr+age+run,
-           PAM50fstoragegragerun=~(TLumA+TLumB)*sample.type+storagegr+age+run, 
-           PAM50fstoragegrISUPagerun=~(TLumA+TLumB)*sample.type+storagegr+ISUPgr+age+run
+forms <- c(ISUPnocovars=~ISUPgr*sampletype,
+           ISUPagerun=~ISUPgr*sampletype+age+run,
+           PAM50nocovars=~Tpam50*sampletype,
+           PAM50agerun=~Tpam50*sampletype+age+run, 
+           PAM50ISUPagerun=~Tpam50*sampletype+ISUPgr+age+run,
+           PAM50fnocovars=~(TLumA+TLumB)*sampletype,
+           PAM50fagerun=~(TLumA+TLumB)*sampletype+age+run, 
+           PAM50fISUPagerun=~(TLumA+TLumB)*sampletype+ISUPgr+age+run
 )
 
 designs$RP <- lapply(forms, function(f) {
@@ -676,23 +600,22 @@ designs$RP <- lapply(forms, function(f) {
 ## One model was fitted to the biopsy dataset: 
 ## a Bx model comparing Bx-tumor, Bx-later-tumor, and Bx-normal-control samples.
 ##No replicated patients, so duplicate correlation is not needed
-designs$Bx <- list(Bxtype=model.matrix(~0+type, data=phBx[idBx,]),
-                   Bxtypestorage=model.matrix(~0+type, data=phBx[idBx,])) ##Fel, men storagetime saknas för tumors
-
+designs$Bx <- list(Bxtype=model.matrix(~0+sampletype, data=phBx[idBx,]))
+colnames(designs$Bx$Bxtype) <- make.names(colnames(designs$Bx$Bxtype))
 ## Additional models combining radical prostatectomy and biopsy samples were also computed. These included 
 ## (i) an ISUP model with normal control tissue comparing sample ISUP status (Tumor 1-2, TINT-N 1-2, TINT-D 1-2, Tumor 3-5, TINT-N 3-5, TINT-D 3-5, Bx-normal-control) and adjusted for age, and 
 ## (ii) a PAM50 model with normal control tissue comparing sample PAM50 status (Tumor LumA, TINT-N LumA, TINT-D LumA, Tumor LumB, TINT-N LumB, TINT-D LumB, Tumor Basal, TINT-N Basal, TINT-D Basal, Bx-normal-control) and adjusted for age.
 ##TINT dataset and normal
-idRPBxN <- meta |> filter(dataset=="TINT"|typeCT=="Normal") |> pull(sampleid)
-meta <- meta |> left_join(pheno |> dplyr::select(sampleid, Tpam50), by="sampleid")
-phRPBxN <- meta |> as.data.frame()
+idRPBxN <- meta |> filter(dataset=="radical prostatectomy"|typeCT=="Normal") |> pull(sampleid)
+meta <- meta |> dplyr::select(-contains("Tpam50")) |> left_join(pheno |> dplyr::select(sampleid, Tpam50), by="sampleid")
+phRPBxN <- meta |> as.data.frame() |> mutate(sampletype=factor(sampletype, levels=c("Bx-control", "Tumor", "TINT-N", "TINT-D")))
 rownames(phRPBxN) <- phRPBxN$sampleid
 phRPBxN <- phRPBxN[idRPBxN,]
-phRPBxN <- phRPBxN |> mutate(typeISUP = factor(if_else(!is.na(ISUP), paste(type, ifelse(ISUP%in%1:2, "12", "35"), sep="."), type)))
-phRPBxN <- phRPBxN |> mutate(typePAM50 = factor(if_else(!is.na(Tpam50), paste(type, Tpam50, sep="."), type)))
+phRPBxN <- phRPBxN |> mutate(typeISUP = factor(if_else(!is.na(ISUPgr), paste(sampletype, ifelse(ISUPgr=="1-2", "12", "35"), sep="."), sampletype)))
+phRPBxN <- phRPBxN |> mutate(typePAM50 = factor(if_else(!is.na(Tpam50), paste(sampletype, Tpam50, sep="."), sampletype)))
 
 formsRPBxN <- list(ISUPNage=~0+typeISUP+age, 
-                   PAM50Nage=~0+typePAM50+age, ISUPNstorageage=~0+typeISUP+storagetime+age, PAM50Nstorageage=~0+typePAM50+storagetime+age)
+                   PAM50Nage=~0+typePAM50+age)
 designs$RPBxN <- lapply(formsRPBxN, function(f) {
   des <- model.matrix(f, data=phRPBxN)
   colnames(des) <- make.names(colnames(des))
@@ -736,51 +659,48 @@ To compare the within patient variation in relation to the overall variation in 
 
 ### Radical prostatectomy dataset
 
-#### T/T1/T2 and  ISUP 3-5/1-2
+#### Tumor/TINT-N/TINT-D and  ISUP 3-5/1-2
 
 Several associations are studied, all of them adjusted for age and run. patientid is taken into account (duplicate correlation). The studied comparisons are the following;
 
-* ISUP35vs12_TINT1 - ISUP 3-5 vs ISUP 1-2 in TINT1
-* ISUP35vs12_TINT2 - ISUP 3-5 vs ISUP 1-2 in TINT2
+* ISUP35vs12_TINTN - ISUP 3-5 vs ISUP 1-2 in TINT-N
+* ISUP35vs12_TINTD - ISUP 3-5 vs ISUP 1-2 in TINT-D
 * ISUP35vs12_T - ISUP 3-5 vs ISUP 1-2 in tumour samples
-* T2vsT1 - T2 vs T1 (all patients)
-* T2vsT1_ISUP35 - T2 vs T1, patients with ISUP 3-5
-* T2vsT1_ISUP12 - T2 vs T1, patients with ISUP 1-2
-* T2vsT - T2 vs T (all patients)
-* T2vsT_ISUP35 - T2 vs T, patients with ISUP 3-5
-* T2vsT_ISUP12 - T2 vs T, patients with ISUP 1-2
-* T1vsT - T1 vs T (all patients)
-* T1vsTISUP35 - T1 vs T, patients with ISUP 3-5
-* T1vsTISUP12 - T1 vs T, patients with ISUP 1-2
-* T2vsT1ISUP35vs12 - The interaction term ISUP35*T2, i.e. the difference in T2 vs T1 between ISUP 3-5 nd 1-2
+* TINTDvsTINTN - TINTD vs TINTN (all patients)
+* TINTDvsTINTN_ISUP35 - TINTD vs TINTN, patients with ISUP 3-5
+* TINTDvsTINTN_ISUP12 - TINTD vs TINTN, patients with ISUP 1-2
+* TINTDvsT - TINTD vs T (all patients)
+* TINTDvsT_ISUP35 - TINTD vs T, patients with ISUP 3-5
+* TINTDvsT_ISUP12 - TINTD vs T, patients with ISUP 1-2
+* TINTNvsT - TINTN vs T (all patients)
+* TINTNvsTISUP35 - TINTN vs T, patients with ISUP 3-5
+* TINTNvsTISUP12 - TINTN vs T, patients with ISUP 1-2
+* TINTDvsTINTNISUP35vs12 - The interaction term ISUP35*TINTD, i.e. the difference in TINTD vs TINTN between ISUP 3-5 nd 1-2
 
-* T1 ISUP 1-2 vs T2 ISUP 3-5
+* TINTN ISUP 1-2 vs TINTD ISUP 3-5
 
 ```{r contrastsISUP}
 ##One model, many contrasts
 ##Contrasts
-alldesignISUP <- cbind(designs$RP$ISUPstoragegragerun, designs$RP$ISUPstorageagerun[, "storagetime", drop=FALSE])  
+alldesignISUP <- designs$RP$ISUPagerun 
 contrastISUP <- makeContrasts(
-  ISUP35vs12_T1 = ISUPgr3.5 + ISUPgr3.5.sample.typeT1,
-  ISUP35vs12_T2 = ISUPgr3.5 + ISUPgr3.5.sample.typeT2,
+  ISUP35vs12_TINTN = ISUPgr3.5 + ISUPgr3.5.sampletypeTINT.N,
+  ISUP35vs12_TINTD = ISUPgr3.5 + ISUPgr3.5.sampletypeTINT.D,
   ISUP35vs12_T = ISUPgr3.5,
-  ISUP35vs12 = ISUPgr3.5 + 1/3*ISUPgr3.5.sample.typeT1 + 1/3*ISUPgr3.5.sample.typeT2,
-  T2vsT1 = sample.typeT2 + 1/2*ISUPgr3.5.sample.typeT2 - sample.typeT1 - 1/2*ISUPgr3.5.sample.typeT1,
-  T2vsT1_ISUP35 = sample.typeT2 + ISUPgr3.5.sample.typeT2 - sample.typeT1 - ISUPgr3.5.sample.typeT1,
-  T2vsT1_ISUP12 = sample.typeT2 - sample.typeT1,
-  T2vsT = sample.typeT2 + 1/2*ISUPgr3.5.sample.typeT2,
-  T2vsT_ISUP35 = sample.typeT2 + ISUPgr3.5.sample.typeT2,
-  T2vsT_ISUP12 = sample.typeT2,
-  T1vsT = sample.typeT1 + 1/2*ISUPgr3.5.sample.typeT1,
-  T1vsT_ISUP35 = sample.typeT1 + ISUPgr3.5.sample.typeT1,
-  T1vsT_ISUP12 = sample.typeT1,
-  T2vsT1ISUP35vs12 = ISUPgr3.5.sample.typeT2 -ISUPgr3.5.sample.typeT1,
-  T2vsTISUP35vs12 = ISUPgr3.5.sample.typeT2,
-  T1vsTISUP35vs12 = ISUPgr3.5.sample.typeT1,
-  T1ISUP12vsT2ISUP35 = sample.typeT1 - sample.typeT2 - ISUPgr3.5 - ISUPgr3.5.sample.typeT2,
-  storagetime = storagetime,
-#  TdistISUP12 = Tdist1 - Tdist0,
-#  TdistISUP35 = Tdist1 - Tdist0,
+  ISUP35vs12 = ISUPgr3.5 + 1/3*ISUPgr3.5.sampletypeTINT.N + 1/3*ISUPgr3.5.sampletypeTINT.D,
+  TINTDvsTINTN = sampletypeTINT.D + 1/2*ISUPgr3.5.sampletypeTINT.D - sampletypeTINT.N - 1/2*ISUPgr3.5.sampletypeTINT.N,
+  TINTDvsTINTN_ISUP35 = sampletypeTINT.D + ISUPgr3.5.sampletypeTINT.D - sampletypeTINT.N - ISUPgr3.5.sampletypeTINT.N,
+  TINTDvsTINTN_ISUP12 = sampletypeTINT.D - sampletypeTINT.N,
+  TINTDvsT = sampletypeTINT.D + 1/2*ISUPgr3.5.sampletypeTINT.D,
+  TINTDvsT_ISUP35 = sampletypeTINT.D + ISUPgr3.5.sampletypeTINT.D,
+  TINTDvsT_ISUP12 = sampletypeTINT.D,
+  TINTNvsT = sampletypeTINT.N + 1/2*ISUPgr3.5.sampletypeTINT.N,
+  TINTNvsT_ISUP35 = sampletypeTINT.N + ISUPgr3.5.sampletypeTINT.N,
+  TINTNvsT_ISUP12 = sampletypeTINT.N,
+  TINTDvsTINTNISUP35vs12 = ISUPgr3.5.sampletypeTINT.D -ISUPgr3.5.sampletypeTINT.N,
+  TINTDvsTISUP35vs12 = ISUPgr3.5.sampletypeTINT.D,
+  TINTNvsTISUP35vs12 = ISUPgr3.5.sampletypeTINT.N,
+  TINTNISUP12vsTINTDISUP35 = sampletypeTINT.N - sampletypeTINT.D - ISUPgr3.5 - ISUPgr3.5.sampletypeTINT.D,
   levels=alldesignISUP)
 
 ##ISUP models with different covariate sets
@@ -798,53 +718,53 @@ tabs <- lapply(fitsISUP, function(fit) sapply(colnames(fit$contrasts), function(
 ```
 
 
-#### T/T1/T2 and PAM50 (LumA, LumB, Basal)
+#### Tumor/TINT-N/TINT-D and PAM50 (LumA, LumB, Basal)
 
-The PAM50 classification of tumor samples is used here, no classifications from T1 or T2 included.
+The PAM50 classification of tumor samples is used here, no classifications from TINT-N or TINT-D included.
 
 Several associations are studied, all of them adjusted for age and run or age, run and ISUP. Also, the same comparisons but adjusted for only age and run are performed as well, these will have the suffix 'woISUP'. The studied comparisons are the following;
 
-* LumAvsother_T1- LumA vs other in TINT1
-* LumAvsother_T2 - LumA vs other in TINT2
+* LumAvsother_TINTN- LumA vs other in TINT-N
+* LumAvsother_TINTD - LumA vs other in TINT-D
 * LumAvsother_T - LumA vs other in tumour samples
 * LumAvsother - LumA vs other in all samples
-* LumBvsother_T1- LumB vs other in TINT1
-* LumBvsother_T2 - LumB vs other in TINT2
+* LumBvsother_TINTN- LumB vs other in TINT-N
+* LumBvsother_TINTD - LumB vs other in TINT-D
 * LumBvsother_T - LumB vs other in tumour samples
 * LumBvsother - LumB vs other in all samples
 * Tumor LumA fraction vs gene expression in 
-  - T1
-  - T2
+  - TINTN
+  - TINTD
   - T
   - all
 * Tumor LumB fraction vs gene expression in
-  - T1
-  - T2
+  - TINTN
+  - TINTD
   - T
   - all
 * Tumor Basal fraction vs gene expression in 
-  - T1
-  - T2
+  - TINTN
+  - TINTD
   - T
   - all
 
 ```{r contrastmodelsPAM50}
-pheno0 <- pheno |> dplyr::select(Tpam50, sample.type) |> distinct()
-design0PAM50 <- model.matrix(~Tpam50*sample.type, data=pheno0)
+pheno0 <- pheno |> dplyr::select(Tpam50, sampletype) |> distinct() |> mutate(sampletype = factor(sampletype, levels=c("Tumor", "TINT-N", "TINT-D")))
+design0PAM50 <- model.matrix(~Tpam50*sampletype, data=pheno0)
 colnames(design0PAM50) <- make.names(colnames(design0PAM50))
 
 ds <- cbind(pheno0, design0PAM50) 
 contrastP0 <- rbind(
-  LumBvsLumA_T1 = ds |> filter(Tpam50=="LumB", sample.type=="T1") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sample.type=="T1") |> reframe(across(-(1:2), mean)),
-  LumBvsLumA_T2 = ds |> filter(Tpam50=="LumB", sample.type=="T2") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sample.type=="T2") |> reframe(across(-(1:2), mean)),
-  LumBvsLumA_T = ds |> filter(Tpam50=="LumB", sample.type=="T") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sample.type=="T") |> reframe(across(-(1:2), mean)),
-  LumAvsother_T1 = ds |> filter(Tpam50=="LumA", sample.type=="T1") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sample.type=="T1") |> reframe(across(-(1:2), mean)),
-LumAvsother_T2 = ds |> filter(Tpam50=="LumA", sample.type=="T2") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sample.type=="T2") |> reframe(across(-(1:2), mean)),
-LumAvsother_T = ds |> filter(Tpam50=="LumA", sample.type=="T") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sample.type=="T") |> reframe(across(-(1:2), mean)),
+  LumBvsLumA_TINTN = ds |> filter(Tpam50=="LumB", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)),
+  LumBvsLumA_TINTD = ds |> filter(Tpam50=="LumB", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)),
+  LumBvsLumA_T = ds |> filter(Tpam50=="LumB", sampletype=="Tumor") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50=="LumA", sampletype=="Tumor") |> reframe(across(-(1:2), mean)),
+  LumAvsother_TINTN = ds |> filter(Tpam50=="LumA", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)),
+LumAvsother_TINTD = ds |> filter(Tpam50=="LumA", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)),
+LumAvsother_T = ds |> filter(Tpam50=="LumA", sampletype=="Tumor") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA", sampletype=="Tumor") |> reframe(across(-(1:2), mean)),
 LumAvsother = ds |> filter(Tpam50=="LumA") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumA") |> reframe(across(-(1:2), mean)),
-LumBvsother_T1 = ds |> filter(Tpam50=="LumB", sample.type=="T1") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sample.type=="T1") |> reframe(across(-(1:2), mean)),
-LumBvsother_T2 = ds |> filter(Tpam50=="LumB", sample.type=="T2") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sample.type=="T2") |> reframe(across(-(1:2), mean)),
-LumBvsother_T = ds |> filter(Tpam50=="LumB", sample.type=="T") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sample.type=="T") |> reframe(across(-(1:2), mean)),
+LumBvsother_TINTN = ds |> filter(Tpam50=="LumB", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sampletype=="TINT-N") |> reframe(across(-(1:2), mean)),
+LumBvsother_TINTD = ds |> filter(Tpam50=="LumB", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sampletype=="TINT-D") |> reframe(across(-(1:2), mean)),
+LumBvsother_T = ds |> filter(Tpam50=="LumB", sampletype=="Tumor") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB", sampletype=="Tumor") |> reframe(across(-(1:2), mean)),
 LumBvsother = ds |> filter(Tpam50=="LumB") |> reframe(across(-(1:2), mean)) - ds |> filter(Tpam50!="LumB") |> reframe(across(-(1:2), mean)))
 
 v <- sapply(designs$RP[grep("^PAM50[^f]", names(designs$RP))], colnames) |> unlist() |> unique()
@@ -860,20 +780,20 @@ fitsPAM50<- sapply(grep("^PAM50[^f]", names(designs$RP), value=TRUE), function(n
 ```
 
 ```{r contrastmodelPAM50f}
-alldesignPAM50f <- cbind(designs$RP$PAM50fstoragegrISUPagerun, designs$RP$PAM50fstorageagerun[, "storagetime", drop=FALSE])  
+alldesignPAM50f <- designs$RP$PAM50fISUPagerun
 contrastPAM50f <- makeContrasts( 
-  LumA_T1 = TLumA + TLumA.sample.typeT1,
-  LumA_T2 = TLumA + TLumA.sample.typeT2,
+  LumA_TINTN = TLumA + TLumA.sampletypeTINT.N,
+  LumA_TINTD = TLumA + TLumA.sampletypeTINT.D,
   LumA_T = TLumA,
-  LumA = TLumA + 1/3*TLumA.sample.typeT1 + 1/3*TLumA.sample.typeT2,
-  LumB_T1 = TLumB + TLumB.sample.typeT1,
-  LumB_T2 = TLumB + TLumB.sample.typeT2,
+  LumA = TLumA + 1/3*TLumA.sampletypeTINT.N + 1/3*TLumA.sampletypeTINT.D,
+  LumB_TINTN = TLumB + TLumB.sampletypeTINT.N,
+  LumB_TINTD = TLumB + TLumB.sampletypeTINT.D,
   LumB_T = TLumB,
-  LumB = TLumB + 1/3*TLumB.sample.typeT1 + 1/3*TLumB.sample.typeT2,
-  Basal_T1 = -TLumA - TLumB - TLumA.sample.typeT1 - TLumB.sample.typeT1,
-  Basal_T2 = -TLumA - TLumB - TLumA.sample.typeT2 - TLumB.sample.typeT2,
+  LumB = TLumB + 1/3*TLumB.sampletypeTINT.N + 1/3*TLumB.sampletypeTINT.D,
+  Basal_TINTN = -TLumA - TLumB - TLumA.sampletypeTINT.N - TLumB.sampletypeTINT.N,
+  Basal_TINTD = -TLumA - TLumB - TLumA.sampletypeTINT.D - TLumB.sampletypeTINT.D,
   Basal_T = -TLumA - TLumB,
-  Basal = -TLumA - TLumB + 1/3*(-TLumA.sample.typeT1 - TLumB.sample.typeT1) + 1/3*(-TLumA.sample.typeT2 - TLumB.sample.typeT2),
+  Basal = -TLumA - TLumB + 1/3*(-TLumA.sampletypeTINT.N - TLumB.sampletypeTINT.N) + 1/3*(-TLumA.sampletypeTINT.D - TLumB.sampletypeTINT.D),
   levels=alldesignPAM50f)
 
 ##PAM50f models with different covariate sets
@@ -906,10 +826,10 @@ This analysis include no repeated measures from any patients, hence no duplicate
 
 ```{r contrastBx}
 contrastBx <- makeContrasts(
-  BxTvsN = typetumor - typenormal,
-  BxLCvsN = typelatercancer - typenormal,
-  BxTvsLC = typetumor - typelatercancer,
-  levels=designs$Bx$Bxtypestorage)  
+  BxTvsN = sampletypeBx.tumor - sampletypeBx.control,
+  BxLCvsN = sampletypeBx.later.cancer - sampletypeBx.control,
+  BxTvsLC = sampletypeBx.tumor - sampletypeBx.later.cancer,
+  levels=designs$Bx$Bxtype)  
 ```
 
 ```{r lmBx}
@@ -927,28 +847,28 @@ tabs <- c(tabs, lapply(fitsBx, function(fit) sapply(colnames(contrastBx), functi
 ```
 
 ### Radical prostatectomy and biopsy samples
-#### T/T1/T2 compared to normal tissue
+#### Tumor/TINT-N/TINT-D compared to normal tissue
 
 Here normal tissue are the benign prostate tissue from men who have not later developed cancer (dataset bombiopsi). 
 
-A model with age as well as sample type (T, T1, T2 or B) and ISUP group is used, patientid is taken into account. The following comparisons are studied;
+A model with age as well as sample type (Tumor, TINT-N, TINT-D or Bx-control) and ISUP group is used, patientid is taken into account. The following comparisons are studied;
 
 * TvsN - tumor vs normal tissue
   - ISUP 1+2
   - ISUP 3+4+5
   - All
-* T1vsN - TINT1 vs normal tissue
+* TINTNvsN - TINT-N vs normal tissue
   - ISUP 1+2
   - ISUP 3+4+5
   - All
-* T2vsN - TINT2 vs normal tissue
+* TINTDvsN - TINT-D vs normal tissue
   - ISUP 1+2
   - ISUP 3+4+5
   - All
-* T1vsT - TINT1 vs tumor
-* T2vsT - TINT2 vs tumor
-* T2vT1 - TINT2 vs TINT1
-* TINT35vsN - TINT1 3-5 + TINT2 3-5 vs N
+* TINTNvsT - TINT-N vs tumor
+* TINTDvsT - TINT-D vs tumor
+* TINTDvTINTN - TINT-D vs TINT-N
+* TINT35vsN - TINT-N 3-5 + TINT-D 3-5 vs Bx-control
 
 Note that the last three comparisons are the same as based on the previous model, but included here as a check. In below plots and tables these six comparisons will be denoted '.wN', to clearly distinguish them from the rest.
 
@@ -961,20 +881,20 @@ phRPBxN |> group_by(typeISUP) |> dplyr::summarize(n=n()) |> gt()
 ```{r lmISUPN}
 ##Contrasts
 contrastN <- makeContrasts(
-  T.12vsN = typeISUPT.12 - typeISUPB,
-  T.35vsN = typeISUPT.35 - typeISUPB,
-  TvsN = 1/2*typeISUPT.12 + 1/2*typeISUPT.35- typeISUPB,
-  T1.12vsN = typeISUPT1.12 - typeISUPB,
-  T1.35vsN = typeISUPT1.35 - typeISUPB,
-  T1vsN = 1/2*typeISUPT1.12 + 1/2*typeISUPT1.35- typeISUPB,
-  T2.12vsN = typeISUPT2.12 - typeISUPB,
-  T2.35vsN = typeISUPT2.35 - typeISUPB,
-  T2vsN = 1/2*typeISUPT2.12 + 1/2*typeISUPT2.35- typeISUPB,
-  T1vsT = 1/2*typeISUPT1.12 + 1/2*typeISUPT1.35- 1/2*typeISUPT.12 - 1/2*typeISUPT.35,
-  T2vsT = 1/2*typeISUPT2.12 + 1/2*typeISUPT2.35- 1/2*typeISUPT.12 - 1/2*typeISUPT.35,
-  T2vT1 = 1/2*typeISUPT2.12 + 1/2*typeISUPT2.35- 1/2*typeISUPT1.12 - 1/2*typeISUPT1.35,
-  TINT35vsN0 = 1/2*typeISUPT1.35 + 1/2*typeISUPT2.35 - typeISUPB,
-  levels=designs$RPBxN$ISUPNstorageage)
+  T.12vsN = typeISUPTumor.12 - typeISUPBx.control,
+  T.35vsN = typeISUPTumor.35 - typeISUPBx.control,
+  TvsN = 1/2*typeISUPTumor.12 + 1/2*typeISUPTumor.35- typeISUPBx.control,
+  TINTN.12vsN = typeISUPTINT.N.12 - typeISUPBx.control,
+  TINTN.35vsN = typeISUPTINT.N.35 - typeISUPBx.control,
+  TINTNvsN = 1/2*typeISUPTINT.N.12 + 1/2*typeISUPTINT.N.35- typeISUPBx.control,
+  TINTD.12vsN = typeISUPTINT.D.12 - typeISUPBx.control,
+  TINTD.35vsN = typeISUPTINT.D.35 - typeISUPBx.control,
+  TINTDvsN = 1/2*typeISUPTINT.D.12 + 1/2*typeISUPTINT.D.35- typeISUPBx.control,
+  TINTNvsT = 1/2*typeISUPTINT.N.12 + 1/2*typeISUPTINT.N.35- 1/2*typeISUPTumor.12 - 1/2*typeISUPTumor.35,
+  TINTDvsT = 1/2*typeISUPTINT.D.12 + 1/2*typeISUPTINT.D.35- 1/2*typeISUPTumor.12 - 1/2*typeISUPTumor.35,
+  TINTDvTINTN = 1/2*typeISUPTINT.D.12 + 1/2*typeISUPTINT.D.35- 1/2*typeISUPTINT.N.12 - 1/2*typeISUPTINT.N.35,
+  TINT35vsN0 = 1/2*typeISUPTINT.N.35 + 1/2*typeISUPTINT.D.35 - typeISUPBx.control,
+  levels=designs$RPBxN$ISUPNage)
 
 fitsN <- sapply(grep("^ISUPN", names(designs$RPBxN), value=TRUE), function(nm) {
   fit <- lmFit(esetallbcp[, idRPBxN], design=designs$RPBxN[[nm]], block=phRPBxN$patientid, correlation=dupcors$ISUPNage$consensus.correlation) 
@@ -996,33 +916,33 @@ Here normal tissue are the benign prostate tissue from men who have not later de
 A model with age as well as sub type (LumA, LumB, Basal or B) is used, patientid is taken into account. The following comparisons are studied;
 
 * LumAvsN - LumA vs normal tissue
-  - T
-  - T1
-  - T2
+  - Tumor
+  - TINT-N
+  - TINT-D
 * LumBvsN - LumB vs normal tissue
-  - T
-  - T1
-  - T2
+  - Tumor
+  - TINT-N
+  - TINT-D
 * BasalvsN - Basal vs normal tissue
-  - T
-  - T1
-  - T2
+  - Tumor
+  - TINT-N
+  - TINT-D
 
 Note that the tumor PAM50 classification is used. The distribution is like this; `r sum(ph$typePAM50=="T.Basal")` Basal, `r sum(ph$typePAM50=="T.LumA")` LumA and `r sum(ph$typePAM50=="T.LumB")` LumB, so interpret results for Basal with caution. There are `r sum(ph$typePAM50=="B")` normal samples.
 
 ```{r lmallP}
 ##Contrasts
 contrastallP <- makeContrasts(
-  T.LumAvsN = typePAM50T.LumA - typePAM50B,
-  T.LumBvsN = typePAM50T.LumB - typePAM50B,
-  T.BasalvsN = typePAM50T.Basal - typePAM50B,
-  T1.LumAvsN = typePAM50T1.LumA - typePAM50B,
-  T1.LumBvsN = typePAM50T1.LumB - typePAM50B,
-  T1.BasalvsN = typePAM50T1.Basal - typePAM50B,
-  T2.LumAvsN = typePAM50T2.LumA - typePAM50B,
-  T2.LumBvsN = typePAM50T2.LumB - typePAM50B,
-  T2.BasalvsN = typePAM50T2.Basal - typePAM50B,
-  levels=designs$RPBxN$PAM50Nstorageage)
+  T.LumAvsN = typePAM50Tumor.LumA - typePAM50Bx.control,
+  T.LumBvsN = typePAM50Tumor.LumB - typePAM50Bx.control,
+  T.BasalvsN = typePAM50Tumor.Basal - typePAM50Bx.control,
+  TINTN.LumAvsN = typePAM50TINT.N.LumA - typePAM50Bx.control,
+  TINTN.LumBvsN = typePAM50TINT.N.LumB - typePAM50Bx.control,
+  TINTN.BasalvsN = typePAM50TINT.N.Basal - typePAM50Bx.control,
+  TINTD.LumAvsN = typePAM50TINT.D.LumA - typePAM50Bx.control,
+  TINTD.LumBvsN = typePAM50TINT.D.LumB - typePAM50Bx.control,
+  TINTD.BasalvsN = typePAM50TINT.D.Basal - typePAM50Bx.control,
+  levels=designs$RPBxN$PAM50Nage)
 fitsP <- sapply(grep("^PAM50N", names(designs$RPBxN), value=TRUE), function(nm) {
   fit <- lmFit(esetallbcp[, idRPBxN], design=designs$RPBxN[[nm]], block=phRPBxN$patientid, correlation=dupcors$PAM50Nage$consensus.correlation)
   fit <- contrasts.fit(fit, contrastallP[colnames(designs$RPBxN[[nm]]),])
@@ -1042,34 +962,6 @@ tabs <- lapply(tabs, function(mod) lapply(mod, function(cmp) cmp |> dplyr::selec
 tabsl <- lapply(tabs, function(tab) tab %>% bind_rows(.id="cmp")) |> bind_rows(.id="model") 
 ```
 
-### Storage time
-
-Storage time in groups (0-5y, 6-10y, >10y) or as a continuous variable (in years) does not seem to make a big difference in the number of significant genes (FDR 5%) in the models and also not for the computed log2FC, see @fig-cmpstoragegr.
-
-Will keep only models with storage time as a continuous variable for the rest of the analyses.
-
-```{r fig-cmpstoragegr}
-#| fig-cap: "Comparison of storage time as continuous value and as three discrete groups."
-#| fig-subcap:
-#|  - "The number of significant genes (FDR 5%) in models with storage time as groups (0-5y, 6-10y, >10y) and as a continuous variable."
-#|  - "The log fold changes of the genes in the ISUP models with storage time as groups and as a continuous variable."
-#| layout-ncol: 2
-Nsig <- tabsl |> group_by(model, cmp) |> dplyr::summarize(n=sum(adj.P.Val<0.05))
-Nsig  |> filter(grepl("storage", model)) |> mutate(storagegr=c("groups", "continuous")[1+1*grepl("storagegr", model)], model = sub("storagegr", "storage", model)) |> pivot_wider(names_from=storagegr, values_from=n) |> ggplot(aes(x=groups, y=continuous)) + geom_point()
-
-##Compare log2FC
-tabsl |> filter(grepl("^ISUP[^N]", model)) |> pivot_wider(id_cols=c("PROBEID", "cmp"), names_from=model, values_from=logFC) |> ggplot(aes(x=ISUPstoragegragerun, y=ISUPstorageagerun, color=cmp)) + geom_point(alpha=0.5) + geom_abline(slope=1, intercept=0) + xlab("groups") + ylab("continuous")
-```
-
-
-```{r tabsfilter}
-tabs <- tabs[!grepl("storagegr", names(tabs))] 
-tabsl <- tabsl |> filter(!grepl("storagegr", model))
-```
-
-
-
-
 ### Result summary
 
 ```{r tbl-Nsignif}
@@ -1087,10 +979,7 @@ Nsig |> filter(grepl("^type", model)) |> dplyr::select(-model, -var) |> pivot_wi
 Nsig |> filter(grepl("^(ISUPN|PAM50N)", model)) |> dplyr::select(var, covars, cmp, n) |> pivot_wider(names_from=covars, values_from=n) |> relocate(var, .before=everything()) |> group_by(var) |> gt(row_group_as_column = TRUE)
 ```
 
-Keep only radical prostatectomy models adjusted for storage time for further analyses.
-
 ```{r Hallmarks}
-library(msigdbr)
 dbs <- list(Hallmark = msigdbr(species = "Homo sapiens", collection = 'H') )
 ##Color according to pathways
 hallmarks <- dbs$Hallmark |> dplyr::select(gs_name, gene_symbol) |> mutate(gs_name=sub("HALLMARK_", "", gs_name), value=1) |> distinct() |> pivot_wider(names_from="gs_name", values_from = "value", values_fill = 0)
@@ -1121,7 +1010,7 @@ pl + geom_hline(data=q5, aes(yintercept = -log10(P.Value)), linetype="dashed")
 #| results: "asis"
 #| cache: false
 #| eval: false
-#cmps <- c("ISUP35vs12_T1", "ISUP35vs12_T2", "ISUP35vs12_T")
+#cmps <- c("ISUP35vs12_TINTN", "ISUP35vs12_TINTD", "ISUP35vs12_T")
 cmps <- c(grep("ISUP35vs12_", unique(tabsl$cmp), value = TRUE), grep("35vsN", unique(tabsl$cmp), value = TRUE), grep("12vsN", unique(tabsl$cmp), value=TRUE), grep("45vs1", unique(tabsl$cmp), value=TRUE)) 
 pl <- sapply(cmps, function(cm) plotcmp(tabsl |> dplyr::filter(cmp==cm)), simplify=FALSE, USE.NAMES=TRUE)
 txt <- sapply(names(pl), function(nm) c(paste("## ", nm), makecodechunk(sprintf("pl$%s ", nm), callout = c(sprintf("label: fig-volcanoHallmark%s", nm), sprintf("fig-cap: \"Volcano plot for %s highlighting Hallmark genes. Click on legend to show/hide.\"", nm), "cache: false")))) |> paste(collapse="\n")
@@ -1131,23 +1020,23 @@ cat(knitr::knit(text=paste(c(":::{.panel-tabset}", txt, ":::"), collapse="\n\n")
 
 Results are summarized in the volcanoplots in @fig-volcanosPA and in the separate file `DE_TINT.xlsx`.
 
-## Correlation between T and T1 or T2
+## Correlation between Tumor and TINT-N or TINT-D
 
-Pearson correlation is computed for all genes between T and T1 and between T and T2, based on ISUP 3-5 or 1-2. The results are saved in the file `correlations.xlsx` (for all genes with p<0.005 for any of the correlations).
+Pearson correlation is computed for all genes between Tumor and TINT-N and between Tumor and TINT-D, based on ISUP 3-5 or 1-2. The results are saved in the file `correlations.xlsx` (for all genes with p<0.005 for any of the correlations).
 
 ```{r corr}
 ## Correlation
-##T vs T1 within ISUP 3-5 or 1-2
-##Same for T vs T2
-ids <- pivot_wider(pheno, id_cols=c("patientid", "ISUPgr", "age", "run"), names_from=sample.type, values_from = sampleid)
-r <- lapply(c("T1", "T2"), function(tint) lapply(list(I35="3-5", I12="1-2", all=c("1-2", "3-5")), function(igr) {
+##Tumor vs TINT-N within ISUP 3-5 or 1-2
+##Same for Tumor vs TINT-D
+ids <- pivot_wider(pheno, id_cols=c("patientid", "ISUPgr", "age", "run"), names_from=sampletype, values_from = sampleid)
+r <- lapply(c("TINT-N", "TINT-D"), function(tint) lapply(list(I35="3-5", I12="1-2", all=c("1-2", "3-5")), function(igr) {
   i <- ids %>% filter(ISUPgr%in%igr)
-  data.frame(TINT=tint, ISUPgr=paste(igr, collapse= " "), t(apply(exprs(esetp), 1, function(x) cor.test(x[i[[tint]]], x[i$T], use="pairwise")[c("estimate", "p.value")] %>% unlist()))) %>% rownames_to_column("transcript")
+  data.frame(TINT=tint, ISUPgr=paste(igr, collapse= " "), t(apply(exprs(esetp), 1, function(x) cor.test(x[i[[tint]]], x[i$Tumor], use="pairwise")[c("estimate", "p.value")] %>% unlist()))) %>% rownames_to_column("transcript")
 }) %>% bind_rows()) %>% bind_rows() %>% dplyr::rename(cor=estimate.cor, p=p.value)
 r <- r %>% group_by(TINT, ISUPgr) %>% mutate(q=p.adjust(p)) %>% ungroup()  
 ```
 
-```{r fig-venn, fig.cap="Number of transcripts that are significanlty correlated between T and T1/T2. All patients or only ISUP 1-2  or 3-5."}
+```{r fig-venn, fig.cap="Number of transcripts that are significanlty correlated between Tumor and TINT-N/TINT-D. All patients or only ISUP 1-2  or 3-5."}
 #| layout-ncol: 3
 #| fig-subcap:
 #|  - "ISUP 3-5"
@@ -1164,16 +1053,16 @@ for (igr in list(I35="3-5", I12="1-2", all=c("1-2 3-5"))) {
 ```{r partialcorr}
 ## Partial correlation
 library(ppcor)
-rp <- lapply(c("T1", "T2"), function(tint) lapply(list(I35="3-5", I12="1-2", all=c("1-2", "3-5")), function(igr) {
+rp <- lapply(c("TINT-N", "TINT-D"), function(tint) lapply(list(I35="3-5", I12="1-2", all=c("1-2", "3-5")), function(igr) {
   i <- ids %>% filter(ISUPgr%in%igr, !is.na(T), !is.na(!!as.symbol(tint)))
   z <- model.matrix(~0+age+run, data=pheno)
   rownames(z) <- pheno$sampleid
-  data.frame(TINT=tint, ISUPgr=paste(igr, collapse= " "), apply(exprs(esetp), 1, function(x) pcor.test(x[i[[tint]]], x[i$T], z[i$T,"age"]))  |> bind_rows(.id="transcript"))
+  data.frame(TINT=tint, ISUPgr=paste(igr, collapse= " "), apply(exprs(esetp), 1, function(x) pcor.test(x[i[[tint]]], x[i$Tumor], z[i$Tumor,"age"]))  |> bind_rows(.id="transcript"))
 }) %>% bind_rows()) %>% bind_rows() |> dplyr::rename(pcor=estimate, p=p.value)
 rp <- rp %>% group_by(TINT, ISUPgr) %>% mutate(q=p.adjust(p)) %>% ungroup()  
 ```
 
-```{r fig-pvenn, fig.cap="Number of transcripts that are significanlty correlated between T and T1/T2, after adjustment for age and run. All patients or only ISUP 1-2  or 3-5."}
+```{r fig-pvenn, fig.cap="Number of transcripts that are significanlty correlated between Tumor and TINT-N/TINT-D, after adjustment for age and run. All patients or only ISUP 1-2  or 3-5."}
 #| layout-ncol: 3
 #| fig-subcap:
 #|  - "ISUP 3-5"
@@ -1190,7 +1079,6 @@ for (igr in list(I35="3-5", I12="1-2", all=c("1-2 3-5"))) {
 ```{r msigdb}
 dbs_list <- lapply(dbs, function(db) split(x = db$gene_symbol, f = db$gs_name))
 
-library(fgsea)
 PA <- lapply(tabs, lapply, function(tab) {
   tab <- tab |> arrange(P.Value) |> group_by(SYMBOL) |> slice_head() |> ungroup() |> arrange(P.Value)
   gl <- tab$t |> setNames(tab$SYMBOL)

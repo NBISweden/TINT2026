@@ -24,7 +24,7 @@ knitr:
      - png
      - pdf
 params:
-  esetdir: '~/Support/4709/TINT/data/esets'
+  esetdir: '../../data/TINT2026/esets'
 ---
 
 ```{r setupratios}
@@ -140,18 +140,18 @@ An overview of how similar (or not similar) the values are is shown in @fig-CDpa
 ```{r fig-CDpairs}
 #| fig-cap: "Scatter plots comparing the CD3 and CD8 genes. Pearson correlation coefficient is printed."
 library(GGally)
-ggpairs(as.data.frame(t(X0)) |> dplyr::select(starts_with(c("CD3", "CD8"))) |> rownames_to_column("sampleid") |> left_join(pheno, by="sampleid"), columns = 2:6, mapping=aes(color=sample.type, alpha=0.5))
+ggpairs(as.data.frame(t(X0)) |> dplyr::select(starts_with(c("CD3", "CD8"))) |> rownames_to_column("sampleid") |> left_join(pheno, by="sampleid"), columns = 2:6, mapping=aes(color=sampletype, alpha=0.5))
 ```
 
 ### Ratio associations
 
 ```{r lm}
-pheno <- pheno |> mutate(ISUPgr = factor(ISUP, levels=1:5, labels=rep(c("1-2", "3-5"), c(2,3))))
+pheno <- pheno |> mutate(sampletype = factor(sampletype, levels=c("Tumor", "TINT-N", "TINT-D")))
 
 ratiosl <- as.data.frame(ratios) |> rownames_to_column("sampleid") |> pivot_longer(-sampleid, names_to = "ratio") |> left_join(pheno, by="sampleid")
 
-forms <- c(ISUPnocovars=~ISUPgr*sample.type,
-           ISUPagerun=~ISUPgr*sample.type+age+run)      
+forms <- c(ISUPnocovars=~ISUPgr*sampletype,
+           ISUPagerun=~ISUPgr*sampletype+age+run)      
 designs <- lapply(forms, function(f) {
   des <- model.matrix(f, data=pheno)
   colnames(des) <- make.names(colnames(des))
@@ -161,8 +161,8 @@ designs <- lapply(forms, function(f) {
 #dupcor <- duplicateCorrelation(X, design=designs$ISUPagerun, block=pheno$patientid)
 
 contrastISUP <- makeContrasts(
-  ISUP35vs12_T1 = ISUPgr3.5 + ISUPgr3.5.sample.typeT1,
-  ISUP35vs12_T2 = ISUPgr3.5 + ISUPgr3.5.sample.typeT2,
+  ISUP35vs12_T1 = ISUPgr3.5 + ISUPgr3.5.sampletypeTINT.N,
+  ISUP35vs12_T2 = ISUPgr3.5 + ISUPgr3.5.sampletypeTINT.D,
   ISUP35vs12_T = ISUPgr3.5,
   levels=designs$ISUPagerun)
 
